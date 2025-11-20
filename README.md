@@ -56,4 +56,4 @@ If you find our work useful, please cite:
   note         = {Preprint},
 }
 ```
-If you have any questions, contact [Rulin Shao](https://rulinshao.github.io/) or open a github issue. 
+If you have any questions, you can contact [Rulin Shao](https://rulinshao.github.io/), [Akari Asai](https://akariasai.github.io/), [Shannon Shen](https://www.szj.io/), and [Hamish Ivison](https://ivison.id.au/) or open a github issue. 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dr-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "dr-agent-lib is an agent library for building deep research agents"
 authors = [
     {name = "Shannon Shen", email = "zejiang@gmail.com"},
@@ -50,6 +50,7 @@ dependencies = [
     "diskcache",
     "typer",
     "omegaconf",
+    "datasets",
 ]
 
 [project.optional-dependencies]
