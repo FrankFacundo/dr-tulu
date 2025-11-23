@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset as hf_load_dataset
 
 from .data_types import DatasetConfig
 
@@ -15,6 +15,7 @@ SUPPORTED_TASKS = {
     "genetic_diseases_qa": "parkmoll/genetic-variants-qa",
     "deep_scholar_bench": "xinranz3/deepscholar_bench_fixed",
     "sqav2": "allenai/asta-bench",
+    "researchqa": "realliyifei/ResearchQA",
 }
 
 DATASET_URLS = {
@@ -63,6 +64,7 @@ def get_ablation_sample_size(benchmark: str, subset_name: str = None) -> int:
         "healthbench": {"hard": 183, "consensus": 183, "all": 366},
         "browsecomp": 1000,
         "simpleqa": 1000,
+        "researchqa": 100,
         "deep_scholar_bench": 63,
         "sqav2": 100,
         "genetic_diseases_qa": 100,
@@ -80,9 +82,9 @@ def get_ablation_sample_size(benchmark: str, subset_name: str = None) -> int:
     return ablation_size
 
 
-def load_eval_dataset(config: DatasetConfig) -> List[Dict]:
+def load_dataset(config: DatasetConfig) -> List[Dict]:
     """
-    Load evaluation dataset using configuration object.
+    Load dataset using configuration object.
 
     Args:
         config: DatasetConfig specifying which dataset to load
@@ -117,6 +119,8 @@ def load_eval_dataset(config: DatasetConfig) -> List[Dict]:
     elif config["name"] == "healthbench":
         subset = config.get("subset", "all")
         return load_healthbench_data(subset, num_examples, shuffle, local_path)
+    elif config["name"] == "researchqa":
+        return load_researchqa_data(num_examples, shuffle)
     elif config["name"] == "deep_scholar_bench":
         return load_deep_scholar_bench_data(num_examples)
     elif config["name"] == "sqav2":
@@ -125,7 +129,7 @@ def load_eval_dataset(config: DatasetConfig) -> List[Dict]:
         return load_genetic_diseases_qa_data(num_examples, shuffle)
     else:
         raise ValueError(
-            f"Unsupported dataset: {config['name']}. Supported datasets: {list(SUPPORTED_TASKS.keys())}, browsecomp, simpleqa, healthbench"
+            f"Unsupported dataset: {config['name']}. Supported datasets: {list(SUPPORTED_TASKS.keys())}, browsecomp, simpleqa, healthbench, researchqa"
         )
 
 
@@ -286,7 +290,7 @@ def load_healthbench_data(
 
 def load_deep_scholar_bench_data(num_examples: Optional[int] = None) -> List[Dict]:
     """Load Deep Scholar Bench dataset data."""
-    raw_data = load_dataset("xinranz3/deepscholar_bench_fixed", "default")
+    raw_data = hf_load_dataset("xinranz3/deepscholar_bench_fixed", "default")
 
     examples = []
     for sample in raw_data["train"]:
@@ -308,7 +312,7 @@ def load_sqav2_data(
     num_examples: Optional[int] = None, shuffle: bool = False
 ) -> List[Dict]:
     """Load SQA v2 dataset data."""
-    data = load_dataset(
+    data = hf_load_dataset(
         "allenai/asta-bench",
         data_files="tasks/sqa/rubrics_v2_recomputed.json",
         split="train",
@@ -340,10 +344,10 @@ def load_genetic_diseases_qa_data(
     """Load Genetic Variants QA dataset data."""
     dataset_repo = SUPPORTED_TASKS["genetic_diseases_qa"]
 
-    question_types_data = load_dataset(
+    question_types_data = hf_load_dataset(
         dataset_repo, data_files="question_types.json", split="train"
     )
-    rare_variants_data = load_dataset(
+    rare_variants_data = hf_load_dataset(
         dataset_repo, data_files="rare_variants_qa.json", split="train"
     )
 
@@ -362,6 +366,52 @@ def load_genetic_diseases_qa_data(
                 "id": hashlib.md5(problem.encode()).hexdigest(),
                 "problem": problem,
                 "additional_instructions": "",
+            }
+        )
+
+    if shuffle:
+        random.seed(42)
+        random.shuffle(examples)
+
+    if num_examples:
+        examples = examples[:num_examples]
+
+    return examples
+
+
+def load_researchqa_data(
+    num_examples: Optional[int] = None,
+    shuffle: bool = False,
+) -> List[Dict]:
+    """
+    Load ResearchQA dataset data.
+    Always loads from the official subset if the IDs file is available.
+
+    Args:
+        num_examples: Limit to first N examples (optional)
+        shuffle: Whether to shuffle the examples
+
+    Returns:
+        List of ResearchQA examples
+    """
+    dataset_repo = SUPPORTED_TASKS["researchqa"]
+    data = hf_load_dataset(dataset_repo, split="test")
+
+    # Try to load official subset IDs if available
+    official_ids_path = Path(__file__).parent / "researchqa_official_subset_ids.json"
+    if official_ids_path.exists():
+        with open(official_ids_path, "r") as f:
+            official_ids = json.load(f)
+        data = data.filter(lambda x: x["id"] in official_ids)
+
+    examples = []
+    for sample in data:
+        examples.append(
+            {
+                "id": hashlib.md5(sample["query"].encode()).hexdigest(),
+                "orig_id": sample["id"],
+                "problem": sample["query"],
+                "additional_instructions": "Answer the question completely and precisely in around 240-260 words. You need to support every statement in the answer with in-line citations to passages given in the context. Don't enumerate the facts. You should provide an answer in one-to-three paragraphs.",
             }
         )
 
