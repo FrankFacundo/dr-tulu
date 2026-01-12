@@ -856,6 +856,42 @@ class LocalSearchTool(MCPSearchTool):
                 pass  # Keep default if conversion fails
 
         return params
+    
+    def _heuristic_title_extraction(
+        self, text: str, docid: str = "", url: Optional[str] = None
+    ) -> str:
+        if not text:
+            return f"Doc {docid}" if docid else "Document"
+
+        # 1. Look for Markdown header
+        md_match = re.search(r"^#+\s+(.+)$", text, re.MULTILINE)
+        if md_match:
+            return md_match.group(1).strip()[:150]
+
+        # 2. Look for "Title: ..." or "Header: ..." pattern
+        title_match = re.search(r"^(?:Title|Header):\s*(.+)$", text, re.I | re.M)
+        if title_match:
+            return title_match.group(1).strip()[:150]
+
+        # 3. Take the first non-empty line if it's reasonably short (like a headline)
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if lines and 10 < len(lines[0]) < 150:
+            return lines[0]
+
+        # 4. Try to derive from URL
+        if url and "/" in url:
+            # Extract the last part of the path, removing query params and fragments
+            path_part = url.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
+            # Avoid just numeric IDs or very short strings
+            if (
+                path_part
+                and len(path_part) > 4
+                and not path_part.replace(".", "").isdigit()
+            ):
+                return path_part.replace("-", " ").replace("_", " ").title()
+
+        # 5. Final Fallback
+        return f"Doc {docid}" if docid else "Document"
 
     def extract_documents(
         self, raw_output: Union[Dict[str, Any], List[Dict[str, Any]]]
@@ -869,8 +905,8 @@ class LocalSearchTool(MCPSearchTool):
             docid = str(item.get("docid", ""))
             url = item.get("url", docid)
             score = item.get("score")
-            
-            title = f"Doc {docid}"
+
+            title = self._heuristic_title_extraction(raw_snippet, docid=docid, url=url)
             snippet = raw_snippet
 
             # Try to parse title and content from snippet
@@ -879,7 +915,7 @@ class LocalSearchTool(MCPSearchTool):
                 parsed_title = match.group("title")
                 if parsed_title:
                     title = parsed_title.strip()
-                
+
                 parsed_content = match.group("content")
                 if parsed_content:
                     snippet = parsed_content.strip()
