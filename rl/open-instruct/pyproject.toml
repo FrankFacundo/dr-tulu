@@ -30,7 +30,7 @@ dependencies = [
     "jsonlines==4.0.0", # for mcp tools
     "fastmcp",
     "dr-agent",
-    "faiss-gpu>=1.7.2",
+    "faiss-gpu-cu12>=1.9.0",
     "tevatron",
     "qwen-omni-utils>=0.0.8",
     "qwen-agent[gui,mcp,rag]>=0.0.10",
