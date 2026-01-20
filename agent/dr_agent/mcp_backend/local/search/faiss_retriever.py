@@ -13,7 +13,7 @@ from tevatron.retriever.arguments import ModelArguments
 from tevatron.retriever.driver.encode import DenseModel
 from tevatron.retriever.searcher import FaissFlatSearcher
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 
 from .base import BaseSearcher, LocalSearchResponse, LocalSearchResult
 
@@ -64,6 +64,7 @@ class FaissSearcher(BaseSearcher):
         )
 
     def __init__(self, args):
+        super().__init__(args)
         if args.model_name == "bm25":
             raise ValueError("model_name cannot be 'bm25' for FAISS searcher")
         if not args.index_path:

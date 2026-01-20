@@ -21,6 +21,7 @@ class BM25Searcher(BaseSearcher):
         )
 
     def __init__(self, args):
+        super().__init__(args)
         self.args = args
         if not args.index_path:
             raise ValueError("index_path is required for BM25 searcher")
