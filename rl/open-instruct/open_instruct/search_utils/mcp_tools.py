@@ -10,7 +10,7 @@ import httpx
 import httpcore
 
 try:
-    from dr_agent.tool_interface.mcp_tools import MassiveServeSearchTool, SemanticScholarSnippetSearchTool, SerperSearchTool, Crawl4AIBrowseTool, SerperBrowseTool
+    from dr_agent.tool_interface.mcp_tools import MassiveServeSearchTool, SemanticScholarSnippetSearchTool, SerperSearchTool, Crawl4AIBrowseTool, SerperBrowseTool, LocalSearchTool, LocalBrowseTool
 except ImportError as e:
     print(f"Failed to import dr_agent. Please install it:\n{e}")
     raise e
@@ -18,11 +18,13 @@ except ImportError as e:
 from open_instruct.search_rewards.utils.format_utils import generate_snippet_id
 from open_instruct.tool_utils.tool_vllm import Tool, ToolOutput
 
+USE_LOCAL_SEARCH = os.environ.get("USE_LOCAL_SEARCH", "false").lower() == "true"
+
 MCP_TOOL_REGISTRY = {
-    "snippet_search": SemanticScholarSnippetSearchTool,
-    "google_search": SerperSearchTool,
+    "snippet_search": LocalSearchTool if USE_LOCAL_SEARCH else SemanticScholarSnippetSearchTool,
+    "google_search": LocalSearchTool if USE_LOCAL_SEARCH else SerperSearchTool,
     "massive_serve": MassiveServeSearchTool,
-    "browse_webpage": Crawl4AIBrowseTool,
+    "browse_webpage": LocalBrowseTool if USE_LOCAL_SEARCH else Crawl4AIBrowseTool,
     # "browse_webpage": SerperBrowseTool
 }
 
@@ -115,8 +117,10 @@ class MCPTool(Tool):
                 filtered_kwargs["context_chars"] = context_chars
             # special case for crawl4ai
             if mcp_tool_name == "browse_webpage":
-                filtered_kwargs["use_docker_version"] = True
-                filtered_kwargs["use_ai2_config"] = True
+                if "use_docker_version" in valid_params:
+                    filtered_kwargs["use_docker_version"] = True
+                if "use_ai2_config" in valid_params:
+                    filtered_kwargs["use_ai2_config"] = True
             # basically, we want to defer as much as possible to the mcp tool.
             # this 'tool' actually just passes everything down to the mcp tool.
             self.mcp_tools.append(mcp_tool_cls(

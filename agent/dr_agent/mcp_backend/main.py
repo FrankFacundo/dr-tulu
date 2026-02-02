@@ -1,9 +1,11 @@
 import argparse
 import asyncio
+import logging
 import os
 from typing import TYPE_CHECKING, Annotated, List, Optional
 
 import aiohttp
+from transformers import AutoTokenizer
 import dotenv
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -30,6 +32,15 @@ from .apis.serper_apis import (
 from .apis.jina_apis import JinaWebpageResponse, fetch_webpage_content_jina
 from .cache import set_cache_enabled
 from .local.crawl4ai_fetcher import Crawl4AiResult
+from .local.search import SearcherType
+from .local.search.base import LocalSearchResponse
+
+# Global instance for local search
+local_searcher = None
+snippet_tokenizer = None
+snippet_max_tokens = 0
+
+logger = logging.getLogger(__name__)
 
 dotenv.load_dotenv()
 
@@ -541,6 +552,79 @@ async def webthinker_fetch_webpage_content_async(
     return {"url": url, "text": text}
 
 
+@mcp.tool(tags={"search", "local"})
+def local_search(
+    query: Annotated[str, "Search query string"],
+    num_results: Annotated[int, "Number of results to return"] = 10,
+) -> LocalSearchResponse:
+    """
+    Perform a search on a local knowledge source.
+    Useful for retrieving relevant passages from specific datasets or local indices.
+    """
+    if local_searcher is None:
+        return {
+            "results": [],
+            "error": "Local searcher not initialized."
+        }
+    
+    try:
+        response = local_searcher.search(query, k=num_results)
+        
+        if snippet_max_tokens > 0 and snippet_tokenizer:
+            for cand in response.get("results", []):
+                snippet_text = cand["snippet"]
+                tokens = snippet_tokenizer.encode(snippet_text, add_special_tokens=False)
+                if len(tokens) > snippet_max_tokens:
+                    truncated_tokens = tokens[:snippet_max_tokens]
+                    cand["snippet"] = snippet_tokenizer.decode(truncated_tokens, skip_special_tokens=True)
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error during local search: {e}")
+        return {"results": [], "error": str(e)}
+
+
+@mcp.tool(tags={"browse", "local"})
+def local_browse(
+    url: Annotated[str, "URL to fetch and extract content from"],
+) -> dict:
+    """
+    Retrieve full text content for a given URL from the local knowledge source.
+    Useful for reading the full content of documents found via local_search.
+    """
+    if local_searcher is None:
+        return {
+            "url": url,
+            "success": False,
+            "markdown": "",
+            "error": "Local index not initialized."
+        }
+    
+    try:
+        text = local_searcher.get_text_by_url(url)
+        if text is None:
+            return {
+                "url": url,
+                "success": False,
+                "markdown": "",
+                "error": f"URL not found: {url}"
+            }
+            
+        return {
+            "url": url,
+            "success": True,
+            "markdown": text
+        }
+    except Exception as e:
+        logger.error(f"Error during local browse: {e}")
+        return {
+            "url": url,
+            "success": False,
+            "markdown": "",
+            "error": str(e)
+        }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the MCP server")
     parser.add_argument(
@@ -577,8 +661,41 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable API response caching",
     )
+    parser.add_argument(
+        "--local-searcher-type",
+        type=str,
+        default=None,
+        choices=SearcherType.get_choices(),
+        help="Type of local searcher to use (default: None, no local search)",
+    )
+    parser.add_argument(
+        "--local-search-max-tokens",
+        type=int,
+        default=100,
+        help="Maximum number of tokens for local search snippets (default: 100, set to 0 to disable truncation)",
+    )
+
+    # We need a first pass to get the searcher type to add its specific args
+    temp_args, _ = parser.parse_known_args()
+    if temp_args.local_searcher_type:
+        searcher_cls = SearcherType.get_searcher_class(temp_args.local_searcher_type)
+        searcher_cls.parse_args(parser)
 
     args = parser.parse_args()
+
+    # Initialize local searcher if specified
+    if args.local_searcher_type:
+        try:
+            searcher_cls = SearcherType.get_searcher_class(args.local_searcher_type)
+            local_searcher = searcher_cls(args)
+            logger.info(f"Initialized local searcher: {args.local_searcher_type}")
+            
+            snippet_max_tokens = args.local_search_max_tokens
+            if snippet_max_tokens > 0:
+                logger.info(f"Loading tokenizer for local search truncation (max {snippet_max_tokens} tokens)...")
+                snippet_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        except Exception as e:
+            logger.error(f"Failed to initialize local searcher: {e}")
 
     # Set cache enabled/disabled based on argument
     if args.no_cache:

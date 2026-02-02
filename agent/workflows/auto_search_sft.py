@@ -182,6 +182,7 @@ class AnswerAgent(BaseAgent):
             "bc_synthetic_depth_one_v2_verified",
             "bc_synthetic_varied_depth_o3_verified",
             "webwalker",
+            "webshaper",
         ]:
             instruction_field_name = "exact_answer"
         elif dataset_name in ["sqav2", "genetic_diseases_qa"]:

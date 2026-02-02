@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-import uuid
+import re
 import warnings
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -807,6 +807,131 @@ class MassiveServeSearchTool(MCPSearchTool):
         return documents
 
 
+class LocalSearchTool(MCPSearchTool):
+    """Tool for searching using a local MCP server"""
+
+    _FM_PATTERN = re.compile(
+        r"---\s*"
+        r"(?:title:\s*(?P<title>.+?)\s*)"
+        r"(?:author:\s*(?P<author>.+?)\s*)?"
+        r"(?:date:\s*(?P<date>.+?)\s*)?"
+        r"---\s*"
+        r"(?P<content>.*?)(?=---|$)",
+        re.DOTALL
+    )
+
+    def __init__(
+        self,
+        tool_parser: Optional[ToolCallParser | str] = None,
+        number_documents_to_search: int = 10,
+        timeout: int = 60,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            tool_parser=tool_parser,
+            number_documents_to_search=number_documents_to_search,
+            timeout=timeout,
+            name=name,
+            description=description,
+            **kwargs,
+        )
+
+    def get_mcp_tool_name(self) -> str:
+        return "local_search"
+
+    def get_mcp_params(self, tool_call_info: ToolCallInfo) -> Dict[str, Any]:
+        """Build parameters for local search API"""
+        params = {
+            "query": tool_call_info.content[:SERPER_MAX_QUERY_LENGTH],
+            "num_results": self.number_documents_to_search,
+        }
+
+        # Override with validated parameters from tool call
+        if "num_results" in tool_call_info.parameters:
+            try:
+                params["num_results"] = int(tool_call_info.parameters["num_results"])
+            except ValueError:
+                pass  # Keep default if conversion fails
+
+        return params
+    
+    def _heuristic_title_extraction(
+        self, text: str, docid: str = "", url: Optional[str] = None
+    ) -> str:
+        if not text:
+            return f"Doc {docid}" if docid else "Document"
+
+        # 1. Look for Markdown header
+        md_match = re.search(r"^#+\s+(.+)$", text, re.MULTILINE)
+        if md_match:
+            return md_match.group(1).strip()[:150]
+
+        # 2. Look for "Title: ..." or "Header: ..." pattern
+        title_match = re.search(r"^(?:Title|Header):\s*(.+)$", text, re.I | re.M)
+        if title_match:
+            return title_match.group(1).strip()[:150]
+
+        # 3. Take the first non-empty line if it's reasonably short (like a headline)
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if lines and 10 < len(lines[0]) < 150:
+            return lines[0]
+
+        # 4. Try to derive from URL
+        if url and "/" in url:
+            # Extract the last part of the path, removing query params and fragments
+            path_part = url.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
+            # Avoid just numeric IDs or very short strings
+            if (
+                path_part
+                and len(path_part) > 4
+                and not path_part.replace(".", "").isdigit()
+            ):
+                return path_part.replace("-", " ").replace("_", " ").title()
+
+        # 5. Final Fallback
+        return f"Doc {docid}" if docid else "Document"
+
+    def extract_documents(
+        self, raw_output: Union[Dict[str, Any], List[Dict[str, Any]]]
+    ) -> List[Document]:
+        """Extract documents from local search response"""
+        results = raw_output.get("results", [])
+
+        documents = []
+        for item in results:
+            raw_snippet = item.get("snippet", "")
+            docid = str(item.get("docid", ""))
+            url = item.get("url", docid)
+            score = item.get("score")
+
+            title = self._heuristic_title_extraction(raw_snippet, docid=docid, url=url)
+            snippet = raw_snippet
+
+            # Try to parse title and content from snippet
+            match = self._FM_PATTERN.search(raw_snippet)
+            if match:
+                parsed_title = match.group("title")
+                if parsed_title:
+                    title = parsed_title.strip()
+
+                parsed_content = match.group("content")
+                if parsed_content:
+                    snippet = parsed_content.strip()
+
+            doc = Document(
+                id=docid,
+                title=title,
+                url=url,
+                snippet=snippet,
+                score=score,
+            )
+            if doc.snippet or doc.url:
+                documents.append(doc)
+
+        return documents
+
 class MCPBrowseTool(MCPMixin, BaseTool, ABC):
     """Base class for MCP browse tools that fetch webpage content from URLs in search results"""
 
@@ -1485,6 +1610,78 @@ class Crawl4AIBrowseTool(MCPBrowseTool):
             return webpage_title, fallback_message
 
         return webpage_title, None
+
+
+class LocalBrowseTool(MCPBrowseTool):
+    """Tool for fetching webpage content from the local knowledge base via MCP"""
+
+    def __init__(
+        self,
+        tool_parser: Optional[ToolCallParser | str] = None,
+        max_pages_to_fetch: int = 5,
+        timeout: int = 120,
+        use_localized_snippets: bool = True,
+        context_chars: int = 2000,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            tool_parser=tool_parser,
+            max_pages_to_fetch=max_pages_to_fetch,
+            timeout=timeout,
+            use_localized_snippets=use_localized_snippets,
+            context_chars=context_chars,
+            name=name,
+            description=description,
+            **kwargs,
+        )
+
+    def get_mcp_tool_name(self) -> str:
+        return "local_browse"
+
+    def get_mcp_params(self, tool_call_info: ToolCallInfo) -> Dict[str, Any]:
+        """Build parameters for Local Browse API"""
+        params = {
+            "url": tool_call_info.content.strip(),
+        }
+        return params
+
+    def _extract_raw_content_from_response(
+        self, raw_output: Dict[str, Any]
+    ) -> Optional[str]:
+        """Extract text content from Local Browse response"""
+        if raw_output.get("success"):
+            return raw_output.get("markdown")
+        return None
+
+    def _extract_metadata_from_document(
+        self, document: Document, raw_output: Dict[str, Any]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Extract metadata for display from the full text"""
+        if not document.text:
+            return None, None
+            
+        match = LocalSearchTool._FM_PATTERN.search(document.text)
+        if match:
+            title = match.group("title")
+            author = match.group("author")
+            date = match.group("date")
+            
+            metadata_parts = []
+            if title:
+                metadata_parts.append(f"Title: {title.strip()}")
+            if author:
+                metadata_parts.append(f"Author: {author.strip()}")
+            if date:
+                metadata_parts.append(f"Date: {date.strip()}")
+                
+            if metadata_parts:
+                return " | ".join(metadata_parts), None
+                
+        return None, None
+
+
 
 
 class MCPRerankerTool(MCPMixin, BaseTool, ABC):

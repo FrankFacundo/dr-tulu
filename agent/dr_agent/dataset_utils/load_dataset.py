@@ -21,6 +21,7 @@ SUPPORTED_TASKS = {
     "researchqa": "realliyifei/ResearchQA",
     "2wiki": "akariasai/2wiki_rand1k",
     "webwalker": "rl-research/webwalker_test",
+    "webshaper": "rl-research/webshaper-heldout",
 }
 
 DATASET_URLS = {
@@ -139,7 +140,7 @@ def load_dataset(config: DatasetConfig) -> List[Dict]:
         return load_genetic_diseases_qa_data(num_examples, shuffle)
     elif config["name"] == "dsqa":
         return load_dsqa_data(num_examples, shuffle)
-    elif config["name"] in ["2wiki", "webwalker"]:
+    elif config["name"] in ["2wiki", "webwalker", "webshaper"]:
         dataset_repo = SUPPORTED_TASKS[config["name"]]
         return load_shortformqa_data(dataset_repo, num_examples, shuffle)
     else:

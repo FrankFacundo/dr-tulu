@@ -29,7 +29,16 @@ dependencies = [
     "immutabledict==1.2.0",
     "jsonlines==4.0.0", # for mcp tools
     "fastmcp",
-    "dr-agent>=0.1.0",
+    "dr-agent",
+    "faiss-gpu-cu12>=1.9.0",
+    "tevatron",
+    "qwen-omni-utils>=0.0.8",
+    "qwen-agent[gui,mcp,rag]>=0.0.10",
+    "torchvision>=0.21.0",
+    "scikit-learn>=1.7.2",
+    "pyserini>=1.2.0",
+    "gspread>=6.2.1",
+    "google-auth>=2.40.3",
 ]
 
 [build-system]
@@ -41,9 +50,11 @@ py-modules = ["open_instruct"]
 
 # pytorch related setups
 [tool.uv.sources]
+dr-agent = { path = "../../agent", editable = true }
 torch = [
   { index = "pytorch-cu124", marker = "platform_system != 'Darwin'"},
 ]
+tevatron = { git = "https://github.com/texttron/tevatron.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

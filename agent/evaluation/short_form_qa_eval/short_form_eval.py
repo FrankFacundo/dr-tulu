@@ -72,6 +72,7 @@ SUPPORTED_TASKS = {
     "bc_synthetic_varied_depth_o3_verified": "rl-rag/verifiable_synthetic_varied_depth_o3_verified",
     "hle": "rl-rag/hle_rlvr_no_prompt",
     "dsqa": "rl-research/dsqa",
+    "webshaper": "rl-research/webshaper-heldout",
 }
 
 

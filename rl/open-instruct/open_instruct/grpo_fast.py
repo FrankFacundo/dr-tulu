@@ -1702,11 +1702,36 @@ def launch_mcp_subprocess(run_mcp_command: str, output_dir: str) -> Optional[sub
     try:
         # Launch subprocess in new process group to avoid signal interference
         
-        # Give the server time to start
-        time.sleep(3)
+        # Wait for server to be ready
+        print("⏳ Waiting for MCP server to initialize (this may take a minute to load indices)...")
+        import re
+        import requests
         
-        # Check if process is still running
-        if mcp_process.poll() is None:
+        port_match = re.search(r'--port\s+(\d+)', run_mcp_command)
+        port = int(port_match.group(1)) if port_match else 8003
+        
+        start_time = time.time()
+        max_wait_time = 600
+        server_ready = False
+        
+        while time.time() - start_time < max_wait_time:
+            if mcp_process.poll() is not None:
+                break
+                
+            try:
+                response = requests.get(f"http://localhost:{port}/health", timeout=1)
+                if response.status_code == 200:
+                    server_ready = True
+                    break
+            except requests.exceptions.RequestException:
+                pass
+                
+            time.sleep(2)
+            if int(time.time() - start_time) % 10 == 0:
+                 print(f"   ... still waiting for MCP server ({int(time.time() - start_time)}s)")
+        
+        # Check if process is still running and ready
+        if mcp_process.poll() is None and server_ready:
             print(f"✅ MCP server started successfully (PID: {mcp_process.pid})")
             print(f"📋 MCP server logs: {os.path.relpath(mcp_logs_dir)}/mcp_server_stdout.log, {os.path.relpath(mcp_logs_dir)}/mcp_server_stderr.log")
             
