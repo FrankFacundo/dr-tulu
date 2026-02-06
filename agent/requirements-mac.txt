@@ -1,0 +1,4 @@
+# macOS (Apple Silicon) requirements for dr-agent
+# vLLM has no macOS wheels. If you build it from source, switch to: -e .[ui,vllm]
+-e .
+-e .[ui]

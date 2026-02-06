@@ -15,11 +15,21 @@ Below we assume you are already in the `agent` directory.
     # conda create -n dr_agent python=3.10 -y && conda activate dr_agent
 
     # Install the latest dev version of dr_agent library 
-    uv pip install -e ".[ui]"    
+    uv pip install -e ".[ui]"
     
     # Or you can directly install from pypi 
     # uv pip install dr_agent 
     ```
+
+    Platform notes:
+    - macOS (Apple Silicon): use `requirements-mac.txt` (no vLLM)
+      ```bash
+      uv pip sync requirements-mac.txt
+      ```
+    - Linux + NVIDIA: use `requirements-linux.txt` (includes vLLM)
+      ```bash
+      uv pip sync requirements-linux.txt
+      ```
 
 2. Setting up the environment variables for the backend service: `cp .env.example .env` and edit the following environment variables 
 
@@ -56,8 +66,22 @@ Below we assume you are already in the `agent` directory.
       ```
       Or you can launch the models separately yourself. 
       ```bash 
-      CUDA_VISIBLE_DEVICES=0 vllm serve rl-research/DR-Tulu-8B --port 30001 --dtype auto --max-model-len 40960
+      CUDA_VISIBLE_DEVICES=0 vllm serve rl-research/DR-Tulu-8B --port 30001 --dtype auto --max-model-len 40960 --max-num-batched-tokens 40960
       ```
+
+      Debugging vLLM startup:
+      - Check logs: `tail -n 50 /tmp/vllm_server_30001.log`
+      - Increase wait time: `--vllm-startup-timeout 600`
+      - Reduce context on macOS: `--vllm-max-model-len 4096 --vllm-max-num-batched-tokens 4096`
+      - If downloads time out, retry with:
+        ```bash
+        export HF_HUB_ENABLE_HF_TRANSFER=1
+        export HF_HUB_DOWNLOAD_TIMEOUT=60
+        ```
+
+      Note: `vllm` does not provide macOS wheels. On Apple Silicon you have two options.
+      - Use the OpenAI config (`workflows/auto_search_sft-oai.yaml`) or point `search_agent_base_url` to a vLLM server running on a Linux machine.
+      - Build vLLM from source (CPU backend) and run it via `python -m vllm.entrypoints.openai.api_server`. If you installed with `pip --user`, add `~/.local/bin` to `PATH` so `vllm` is discoverable.
 
 
 > [!NOTE]

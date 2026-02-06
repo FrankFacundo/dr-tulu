@@ -115,8 +115,22 @@ def launch_mcp_server(
         return None
 
 
+def _tail_log(path: Path, num_lines: int = 20) -> str:
+    try:
+        with open(path, "r") as f:
+            return "".join(f.readlines()[-num_lines:])
+    except Exception:
+        return ""
+
+
 def launch_vllm_server(
-    model_name: str, port: int, gpu_id: int = 0, logger: Optional[logging.Logger] = None
+    model_name: str,
+    port: int,
+    gpu_id: int = 0,
+    logger: Optional[logging.Logger] = None,
+    max_model_len: Optional[int] = None,
+    max_num_batched_tokens: Optional[int] = None,
+    startup_timeout: int = 300,
 ) -> Optional[subprocess.Popen]:
     """Launch vLLM server in background."""
     console = Console()
@@ -129,6 +143,7 @@ def launch_vllm_server(
         )
 
     # Try to find vllm command
+    import importlib.util
     import shutil
 
     vllm_base_cmd = None
@@ -139,12 +154,16 @@ def launch_vllm_server(
         or os.environ.get("VIRTUAL_ENV", "").endswith(".venv")
     )
 
+    local_vllm = Path.home() / ".local" / "bin" / "vllm"
+
     if shutil.which("vllm"):
         vllm_base_cmd = ["vllm", "serve"]
+    elif local_vllm.exists():
+        vllm_base_cmd = [str(local_vllm), "serve"]
+    elif sys.executable and importlib.util.find_spec("vllm") is not None:
+        vllm_base_cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server"]
     elif is_uv and shutil.which("uv"):
         vllm_base_cmd = ["uv", "run", "vllm", "serve"]
-    elif sys.executable:
-        vllm_base_cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server"]
 
     if not vllm_base_cmd:
         if logger:
@@ -160,6 +179,11 @@ def launch_vllm_server(
             )
         return None
 
+    if max_model_len is None:
+        max_model_len = 4096 if sys.platform == "darwin" else 40960
+    if max_num_batched_tokens is None:
+        max_num_batched_tokens = max_model_len
+
     cmd = vllm_base_cmd + [
         model_name,
         "--port",
@@ -167,7 +191,9 @@ def launch_vllm_server(
         "--dtype",
         "auto",
         "--max-model-len",
-        "40960",
+        str(max_model_len),
+        "--max-num-batched-tokens",
+        str(max_num_batched_tokens),
     ]
 
     env = os.environ.copy()
@@ -198,7 +224,7 @@ def launch_vllm_server(
         )
 
     start_time = time.time()
-    while time.time() - start_time < 300:
+    while time.time() - start_time < startup_timeout:
         if check_port(port):
             if logger:
                 logger.info(f"vLLM server started (PID: {process.pid})")
@@ -218,6 +244,10 @@ def launch_vllm_server(
                     f"[red]❌[/red] vLLM server failed to start [dim](exit code: {process.returncode})[/dim]"
                 )
                 console.print(f"[dim]Check logs: {log_file}[/dim]")
+                tail = _tail_log(log_file)
+                if tail:
+                    console.print("[dim]Last 20 lines of log:[/dim]")
+                    console.print(tail)
             return None
 
         time.sleep(2)
@@ -240,6 +270,11 @@ def launch_vllm_server(
             console.print(
                 "[yellow]⚠[/yellow] vLLM server process started but port check timed out. It may still be initializing..."
             )
+            console.print(f"[dim]Check logs: {log_file}[/dim]")
+            tail = _tail_log(log_file)
+            if tail:
+                console.print("[dim]Last 20 lines of log:[/dim]")
+                console.print(tail)
         return process
     else:
         if logger:

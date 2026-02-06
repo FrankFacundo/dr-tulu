@@ -136,7 +136,14 @@ def check_vllm_server(base_url: str) -> bool:
         return True  # Don't fail if we can't check
 
 
-def launch_vllm_server(model_name: str, port: int, gpu_id: int = 0) -> Optional[subprocess.Popen]:
+def launch_vllm_server(
+    model_name: str,
+    port: int,
+    gpu_id: int = 0,
+    max_model_len: int = 40960,
+    max_num_batched_tokens: Optional[int] = None,
+    startup_timeout: int = 300,
+) -> Optional[subprocess.Popen]:
     """Launch vLLM server in background."""
     print(f"🚀 Launching vLLM server for model {model_name} on port {port}...")
     
@@ -153,8 +160,11 @@ def launch_vllm_server(model_name: str, port: int, gpu_id: int = 0) -> Optional[
     
     # Try different ways to invoke vllm (in order of preference)
     # 1. Try direct vllm command first (most reliable)
+    local_vllm = Path.home() / ".local" / "bin" / "vllm"
     if shutil.which("vllm"):
         vllm_base_cmd = ["vllm", "serve"]
+    elif local_vllm.exists():
+        vllm_base_cmd = [str(local_vllm), "serve"]
     # 2. Try uv run vllm if in uv environment
     elif is_uv and shutil.which("uv"):
         vllm_base_cmd = ["uv", "run", "vllm", "serve"]
@@ -167,18 +177,34 @@ def launch_vllm_server(model_name: str, port: int, gpu_id: int = 0) -> Optional[
         print("💡 Install vllm with: uv pip install -e '.[vllm]' or uv pip install 'dr_agent[vllm]'")
         print("💡 Or launch the server manually:")
         if is_uv and shutil.which("uv"):
-            print(f"   CUDA_VISIBLE_DEVICES={gpu_id} uv run vllm serve {model_name} --port {port} --dtype auto --max-model-len 40960")
+            max_num_batched_tokens = max_num_batched_tokens or max_model_len
+            print(
+                f"   CUDA_VISIBLE_DEVICES={gpu_id} uv run vllm serve {model_name} --port {port} --dtype auto --max-model-len {max_model_len} --max-num-batched-tokens {max_num_batched_tokens}"
+            )
         else:
-            print(f"   CUDA_VISIBLE_DEVICES={gpu_id} vllm serve {model_name} --port {port} --dtype auto --max-model-len 40960")
+            max_num_batched_tokens = max_num_batched_tokens or max_model_len
+            print(
+                f"   CUDA_VISIBLE_DEVICES={gpu_id} vllm serve {model_name} --port {port} --dtype auto --max-model-len {max_model_len} --max-num-batched-tokens {max_num_batched_tokens}"
+            )
         return None
     
     # Build vLLM command
     # Note: vllm_base_cmd already includes 'serve' or equivalent
+    if max_num_batched_tokens is None:
+        max_num_batched_tokens = max_model_len
+
+    if sys.platform == "darwin" and max_model_len > 8192:
+        print(
+            "⚠ macOS detected: vLLM will run on CPU and large contexts (e.g., 40960) can take a long time to load. "
+            "Consider --vllm-max-model-len 4096 for faster startup."
+        )
+
     cmd = vllm_base_cmd + [
         model_name,
         "--port", str(port),
         "--dtype", "auto",
-        "--max-model-len", "40960"
+        "--max-model-len", str(max_model_len),
+        "--max-num-batched-tokens", str(max_num_batched_tokens),
     ]
     
     # Set CUDA_VISIBLE_DEVICES if specified
@@ -203,7 +229,7 @@ def launch_vllm_server(model_name: str, port: int, gpu_id: int = 0) -> Optional[
         
         # Wait for server to start
         start_time = time.time()
-        while time.time() - start_time < 300:  # Wait up to 5 minutes
+        while time.time() - start_time < startup_timeout:
             if check_port(port):
                 print(f"✓ vLLM server started (PID: {process.pid})")
                 return process
@@ -231,6 +257,13 @@ def launch_vllm_server(model_name: str, port: int, gpu_id: int = 0) -> Optional[
         # Check if process is still running
         if process.poll() is None:
             print(f"⚠ vLLM server process started but port check timed out. It may still be initializing...")
+            print(f"Check logs: {log_file}")
+            try:
+                with open(log_file, "r") as f:
+                    print("Last 20 lines of log:")
+                    print("".join(f.readlines()[-20:]))
+            except Exception:
+                pass
             return process
         else:
             print(f"❌ vLLM server failed to start (exit code: {process.returncode})")
@@ -324,6 +357,30 @@ Examples:
         default=0,
         help="GPU ID for search agent vLLM server (default: 0, browse agent uses GPU 1)"
     )
+    default_max_model_len = 40960
+    if sys.platform == "darwin":
+        default_max_model_len = 4096
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=default_max_model_len,
+        help="Max model length to pass to vLLM server (default: 40960 on Linux, 4096 on macOS)",
+    )
+    parser.add_argument(
+        "--vllm-max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Max num batched tokens for vLLM (defaults to --vllm-max-model-len)",
+    )
+    default_startup_timeout = 300
+    if sys.platform == "darwin":
+        default_startup_timeout = 600
+    parser.add_argument(
+        "--vllm-startup-timeout",
+        type=int,
+        default=default_startup_timeout,
+        help="Seconds to wait for vLLM to become ready (default: 300 on Linux, 600 on macOS)",
+    )
     parser.add_argument(
         "--no-auto-launch",
         action="store_true",
@@ -348,6 +405,9 @@ Examples:
         resolved_config_path = config_path
     
     processes = {"mcp": None, "vllm_search": None, "vllm_browse": None}
+    config_data = {}
+    config_search_max_tokens = None
+    config_browse_max_tokens = None
     
     # Cleanup function
     def cleanup():
@@ -420,6 +480,9 @@ Examples:
         search_base_url = config_data.get('search_agent_base_url')
         browse_model = config_data.get('browse_agent_model_name')
         browse_base_url = config_data.get('browse_agent_base_url') if config_data.get('use_browse_agent') else None
+        # Clamp client max tokens if vLLM max model len is smaller
+        config_search_max_tokens = config_data.get("search_agent_max_tokens")
+        config_browse_max_tokens = config_data.get("browse_agent_max_tokens")
         
         # Determine if we need to launch servers
         need_search_server = search_base_url and not check_vllm_server(search_base_url)
@@ -431,7 +494,14 @@ Examples:
                 port = _extract_port_from_url(search_base_url)
                 if port:
                     print(f"🚀 Auto-launching Search Agent vLLM server: {search_model} on port {port} (GPU {args.gpu_id})...")
-                    processes["vllm_search"] = launch_vllm_server(search_model, port, args.gpu_id)
+                    processes["vllm_search"] = launch_vllm_server(
+                        search_model,
+                        port,
+                        args.gpu_id,
+                        max_model_len=args.vllm_max_model_len,
+                        max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+                        startup_timeout=args.vllm_startup_timeout,
+                    )
                     if not processes["vllm_search"]:
                         print("⚠ Failed to start Search Agent vLLM server.")
             
@@ -441,7 +511,14 @@ Examples:
                     # Use GPU 1 for browse agent if search agent uses GPU 0, otherwise same GPU
                     browse_gpu = args.gpu_id + 1 if args.gpu_id == 0 else args.gpu_id
                     print(f"🚀 Auto-launching Browse Agent vLLM server: {browse_model} on port {port} (GPU {browse_gpu})...")
-                    processes["vllm_browse"] = launch_vllm_server(browse_model, port, browse_gpu)
+                    processes["vllm_browse"] = launch_vllm_server(
+                        browse_model,
+                        port,
+                        browse_gpu,
+                        max_model_len=args.vllm_max_model_len,
+                        max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+                        startup_timeout=args.vllm_startup_timeout,
+                    )
                     if not processes["vllm_browse"]:
                         print("⚠ Failed to start Browse Agent vLLM server.")
         else:
@@ -450,14 +527,20 @@ Examples:
                 port = _extract_port_from_url(search_base_url)
                 if port:
                     print(f"💡 Search Agent vLLM server not running. Launch manually:")
-                    print(f"   vllm serve {search_model} --port {port} --dtype auto --max-model-len 40960")
+                    max_num_batched_tokens = args.vllm_max_num_batched_tokens or args.vllm_max_model_len
+                    print(
+                        f"   vllm serve {search_model} --port {port} --dtype auto --max-model-len {args.vllm_max_model_len} --max-num-batched-tokens {max_num_batched_tokens}"
+                    )
             
             if need_browse_server and browse_model and browse_base_url:
                 port = _extract_port_from_url(browse_base_url)
                 if port:
                     browse_gpu = args.gpu_id + 1 if args.gpu_id == 0 else args.gpu_id
                     print(f"💡 Browse Agent vLLM server not running. Launch manually:")
-                    print(f"   CUDA_VISIBLE_DEVICES={browse_gpu} vllm serve {browse_model} --port {port} --dtype auto --max-model-len 40960")
+                    max_num_batched_tokens = args.vllm_max_num_batched_tokens or args.vllm_max_model_len
+                    print(
+                        f"   CUDA_VISIBLE_DEVICES={browse_gpu} vllm serve {browse_model} --port {port} --dtype auto --max-model-len {args.vllm_max_model_len} --max-num-batched-tokens {max_num_batched_tokens}"
+                    )
     
     # Build command for interactive_auto_search.py
     cmd = [sys.executable, "scripts/interactive_auto_search.py", "--config", str(resolved_config_path)]
@@ -482,6 +565,21 @@ Examples:
 
     # Always propagate MCP port to workflow configuration
     overrides.append(f"mcp_port={args.mcp_port}")
+    max_num_batched_tokens = args.vllm_max_num_batched_tokens or args.vllm_max_model_len
+    overrides.append(f"vllm_max_model_len={args.vllm_max_model_len}")
+    overrides.append(f"vllm_max_num_batched_tokens={max_num_batched_tokens}")
+    overrides.append(f"vllm_startup_timeout={args.vllm_startup_timeout}")
+
+    # If vLLM max model len is smaller than configured max tokens, clamp it.
+    if config_data:
+        if isinstance(config_search_max_tokens, int) and args.vllm_max_model_len < config_search_max_tokens:
+            overrides.append(f"search_agent_max_tokens={args.vllm_max_model_len}")
+        if (
+            config_data.get("use_browse_agent")
+            and isinstance(config_browse_max_tokens, int)
+            and args.vllm_max_model_len < config_browse_max_tokens
+        ):
+            overrides.append(f"browse_agent_max_tokens={args.vllm_max_model_len}")
     
     if overrides:
         cmd.extend(["--config-overrides", ",".join(overrides)])
@@ -503,4 +601,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

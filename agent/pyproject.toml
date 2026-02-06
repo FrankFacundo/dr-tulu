@@ -85,3 +85,11 @@ testpaths = "tests"
 addopts = "-v --tb=short"
 markers = "integration: tests requiring real API access"
 asyncio_mode = "auto"
+
+[tool.uv]
+# Ensure uv resolves for both macOS (no vLLM) and Linux (vLLM available).
+required-environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]

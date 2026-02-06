@@ -288,6 +288,11 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         browse_agent_max_tokens: int = 32000
         browse_agent_temperature: float = 0.3
 
+        # vLLM launch configuration (optional overrides)
+        vllm_max_model_len: Optional[int] = None
+        vllm_max_num_batched_tokens: Optional[int] = None
+        vllm_startup_timeout: int = 300
+
         # MCP transport configuration
         mcp_transport_type: str = "StreamableHttpTransport"
         mcp_executable: Optional[str] = None
@@ -363,7 +368,13 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                         f"Launch vLLM server for [cyan]{search_model}[/cyan] on port {port}?"
                     ):
                         process = launch_vllm_server(
-                            search_model, port, gpu_id=0, logger=self.logger
+                            search_model,
+                            port,
+                            gpu_id=0,
+                            logger=self.logger,
+                            max_model_len=getattr(cfg, "vllm_max_model_len", None),
+                            max_num_batched_tokens=getattr(cfg, "vllm_max_num_batched_tokens", None),
+                            startup_timeout=getattr(cfg, "vllm_startup_timeout", 300),
                         )
                         if process:
                             self._launched_processes.append(process)
@@ -374,13 +385,17 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                             console.print(
                                 f"[yellow]⚠[/yellow]  Failed to start vLLM server. Manual launch command:"
                             )
+                            max_len = getattr(cfg, "vllm_max_model_len", None) or 40960
+                            max_batch = getattr(cfg, "vllm_max_num_batched_tokens", None) or max_len
                             console.print(
-                                f"   [dim]CUDA_VISIBLE_DEVICES=0 vllm serve {search_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                                f"   [dim]CUDA_VISIBLE_DEVICES=0 vllm serve {search_model} --port {port} --dtype auto --max-model-len {max_len} --max-num-batched-tokens {max_batch}[/dim]"
                             )
                     else:
                         console.print(f"[blue]💡[/blue]  Manual launch command:")
+                        max_len = getattr(cfg, "vllm_max_model_len", None) or 40960
+                        max_batch = getattr(cfg, "vllm_max_num_batched_tokens", None) or max_len
                         console.print(
-                            f"   [dim]CUDA_VISIBLE_DEVICES=0 vllm serve {search_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                            f"   [dim]CUDA_VISIBLE_DEVICES=0 vllm serve {search_model} --port {port} --dtype auto --max-model-len {max_len} --max-num-batched-tokens {max_batch}[/dim]"
                         )
             elif port:
                 console.print(
@@ -403,7 +418,13 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                             f"Launch vLLM server for [cyan]{browse_model}[/cyan] on port {port}?"
                         ):
                             process = launch_vllm_server(
-                                browse_model, port, gpu_id=1, logger=self.logger
+                                browse_model,
+                                port,
+                                gpu_id=1,
+                                logger=self.logger,
+                                max_model_len=getattr(cfg, "vllm_max_model_len", None),
+                                max_num_batched_tokens=getattr(cfg, "vllm_max_num_batched_tokens", None),
+                                startup_timeout=getattr(cfg, "vllm_startup_timeout", 300),
                             )
                             if process:
                                 self._launched_processes.append(process)
@@ -414,8 +435,10 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                                 console.print(
                                     f"[yellow]⚠[/yellow]  Failed to start vLLM server. Manual launch command:"
                                 )
+                                max_len = getattr(cfg, "vllm_max_model_len", None) or 40960
+                                max_batch = getattr(cfg, "vllm_max_num_batched_tokens", None) or max_len
                                 console.print(
-                                    f"   [dim]CUDA_VISIBLE_DEVICES=1 vllm serve {browse_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                                    f"   [dim]CUDA_VISIBLE_DEVICES=1 vllm serve {browse_model} --port {port} --dtype auto --max-model-len {max_len} --max-num-batched-tokens {max_batch}[/dim]"
                                 )
                         else:
                             console.print(f"[blue]💡[/blue]  Manual launch command:")

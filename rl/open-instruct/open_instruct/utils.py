@@ -54,6 +54,8 @@ from huggingface_hub import HfApi
 from rich.pretty import pprint
 from transformers import MODEL_FOR_CAUSAL_LM_MAPPING, HfArgumentParser
 
+from open_instruct.device_utils import maybe_empty_cache
+
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
@@ -1358,7 +1360,12 @@ class RayProcess:
         return self.master_addr, self.master_port
 
     def empty_cache(self) -> None:
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            maybe_empty_cache("cuda")
+        elif torch.backends.mps.is_available():
+            maybe_empty_cache("mps")
+        else:
+            maybe_empty_cache("cpu")
 
     def _set_numa_affinity(self, rank):
         def local_rank_to_real_gpu_id(local_rank):

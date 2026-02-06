@@ -73,6 +73,45 @@ You can also test you have setup training correctly by running the `train_dr_tul
 
 I don't know if this trains a good model, but at least it should let you test your training setup works before touching distributed training!
 
+### Apple Silicon (Mac, single machine)
+
+You can run a single-machine training loop on Apple Silicon (MPS) or CPU without NVIDIA GPUs. This path uses:
+
+- `--training_backend torch` (no DeepSpeed)
+- `--rollout_backend hf` (no vLLM)
+- One learner only (`--num_learners_per_node 1`)
+
+Tool-use rollouts are **not** supported with the HF backend. Use `--tools` only with the vLLM backend on CUDA.
+
+Suggested setup:
+
+```bash
+cd rl/open-instruct
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+uv sync
+
+# Example small run
+bash train_dr_tulu_mini_base_mac.sh
+```
+
+If you want to run directly:
+
+```bash
+uv run python open_instruct/grpo_fast.py \
+  --device mps \
+  --training_backend torch \
+  --rollout_backend hf \
+  --num_learners_per_node 1 \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --dataset_mixer_list rl-research/dr-tulu-rl-data 1.0 \
+  --dataset_mixer_list_splits train \
+  --total_episodes 128 \
+  --num_unique_prompts_rollout 4 \
+  --num_samples_per_prompt_rollout 2 \
+  --response_length 512 \
+  --max_prompt_token_length 256
+```
+
 ### MCP Tool debugging
 
 Sometimes the MCP tool can have some issues, so you should check the MCP server logs to debug and check its running correctly. For example, sometimes the port doesn't bind.

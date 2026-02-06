@@ -56,9 +56,9 @@ class ModelConfig:
     """The specific model version to use (can be a branch name, tag name or commit id)."""
     torch_dtype: Optional[str] = None
     """Override the default `torch.dtype` and load the model under this dtype."""
-    attn_implementation: Optional[Literal["flash_attention_2"]] = None
-    """Which attention implementation to use; you can run --attn_implementation=flash_attention_2, in which case
-    you must install this manually by running `pip install flash-attn --no-build-isolation`"""
+    attn_implementation: Optional[Literal["flash_attention_2", "sdpa", "eager"]] = None
+    """Which attention implementation to use. Use `flash_attention_2` on CUDA with flash-attn installed, or
+    `sdpa`/`eager` for CPU/MPS compatibility."""
     use_cache: Optional[bool] = None
     """Whether to use cache in the model."""
     gradient_checkpointing: bool = False

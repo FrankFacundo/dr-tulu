@@ -16,19 +16,60 @@ from typing import Optional, Union
 import requests
 from rich.console import Console
 from tqdm import tqdm
-from vllm import (
-    LLM,
-    PoolingParams,
-    PoolingRequestOutput,
-    PromptType,
-    RequestOutput,
-    SamplingParams,
-    TokensPrompt,
-)
-from vllm.lora.request import LoRARequest
-from vllm.model_executor.guided_decoding.guided_fields import GuidedDecodingRequest
-from vllm.prompt_adapter.request import PromptAdapterRequest
-from vllm.sampling_params import RequestOutputKind
+try:
+    from vllm import (
+        LLM,
+        PoolingParams,
+        PoolingRequestOutput,
+        PromptType,
+        RequestOutput,
+        SamplingParams,
+        TokensPrompt,
+    )
+    from vllm.lora.request import LoRARequest
+    from vllm.model_executor.guided_decoding.guided_fields import GuidedDecodingRequest
+    from vllm.prompt_adapter.request import PromptAdapterRequest
+    from vllm.sampling_params import RequestOutputKind
+
+    VLLM_AVAILABLE = True
+    VLLM_IMPORT_ERROR: Optional[Exception] = None
+except Exception as e:  # pragma: no cover - only triggered on non-vLLM environments
+    VLLM_AVAILABLE = False
+    VLLM_IMPORT_ERROR = e
+
+    # Minimal placeholders so imports succeed when vLLM is not installed.
+    class LLM:  # type: ignore[override]
+        pass
+
+    class PoolingParams:  # type: ignore[override]
+        pass
+
+    class PoolingRequestOutput:  # type: ignore[override]
+        pass
+
+    class PromptType:  # type: ignore[override]
+        pass
+
+    class RequestOutput:  # type: ignore[override]
+        pass
+
+    class SamplingParams:  # type: ignore[override]
+        pass
+
+    class TokensPrompt:  # type: ignore[override]
+        pass
+
+    class LoRARequest:  # type: ignore[override]
+        pass
+
+    class GuidedDecodingRequest:  # type: ignore[override]
+        pass
+
+    class PromptAdapterRequest:  # type: ignore[override]
+        pass
+
+    class RequestOutputKind:  # type: ignore[override]
+        FINAL_ONLY = "final_only"
 
 
 @dataclass
@@ -150,6 +191,11 @@ class PythonCodeTool(Tool):
 
 class ToolUseLLM(LLM):
     def __init__(self, tools: dict[str, Tool] = None, max_tool_calls: Union[int, dict[str, int]] = 4, *args, **kwargs):
+        if not VLLM_AVAILABLE:
+            raise ImportError(
+                "vLLM is required for ToolUseLLM but is not available. "
+                f"Original error: {VLLM_IMPORT_ERROR}"
+            )
         self.tools = tools
         # Convert max_tool_calls to a dict if it's an int
         if isinstance(max_tool_calls, int):
@@ -410,6 +456,11 @@ class ToolUseLLM(LLM):
 
 
 if __name__ == "__main__":
+    if not VLLM_AVAILABLE:
+        raise SystemExit(
+            "vLLM is not available. Install vllm to run this script. "
+            f"Original error: {VLLM_IMPORT_ERROR}"
+        )
     console = Console()
     from transformers import AutoTokenizer
 

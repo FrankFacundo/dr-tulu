@@ -1,0 +1,3 @@
+# Linux requirements for dr-agent (includes vLLM)
+-e .
+-e .[ui,vllm]

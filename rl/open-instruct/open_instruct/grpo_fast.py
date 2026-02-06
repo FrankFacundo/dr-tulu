@@ -38,8 +38,10 @@ try:
     # RuntimeError: 0 active drivers ([]). There should only be one.
     # so we need to catch the exception and do nothing
     # https://github.com/deepspeedai/DeepSpeed/issues/7028
+    DEEPSPEED_AVAILABLE = True
 except Exception:
-    pass
+    deepspeed = None
+    DEEPSPEED_AVAILABLE = False
 # isort: on
 
 import asyncio
@@ -83,7 +85,14 @@ from transformers import (
     get_scheduler,
 )
 from transformers.integrations import HfDeepSpeedConfig
-from vllm import SamplingParams
+
+try:
+    from vllm import SamplingParams
+
+    VLLM_AVAILABLE = True
+except Exception:
+    SamplingParams = None
+    VLLM_AVAILABLE = False
 
 from open_instruct.dataset_transformation import (
     DATASET_ORIGIN_KEY,
@@ -134,6 +143,15 @@ from open_instruct.utils import (
 )
 from open_instruct.tool_utils.tool_actor import ToolActor, TOOL_CLASS_REGISTRY
 from open_instruct.tool_utils.tool_proxy import ToolProxy
+from open_instruct.device_utils import (
+    maybe_empty_cache,
+    resolve_attn_implementation,
+    resolve_device_type,
+    resolve_dtype_str,
+    resolve_rollout_backend,
+    resolve_training_backend,
+    torch_dtype_from_str,
+)
 from open_instruct.vllm_utils3 import create_vllm_engines, init_process_group
 from open_instruct.search_utils.mcp_tools import MCP_TOOL_REGISTRY
 
@@ -182,6 +200,20 @@ class Args:
     """Seed of the experiment"""
     run_name: Optional[str] = None
     """RUNTIME VALUE: A unique name of this run"""
+
+    # Runtime / backend
+    device: Optional[str] = None
+    """Force device type: cuda, mps, or cpu. Defaults to auto-detect."""
+    device_type: Optional[str] = None
+    """RUNTIME VALUE: Resolved device type."""
+    training_backend: Literal["auto", "deepspeed", "torch"] = "auto"
+    """Training backend selection."""
+    rollout_backend: Literal["auto", "vllm", "hf"] = "auto"
+    """Rollout generation backend."""
+    use_vllm: bool = False
+    """RUNTIME VALUE: Whether vLLM is used for rollouts."""
+    use_deepspeed: bool = False
+    """RUNTIME VALUE: Whether DeepSpeed is used for training."""
 
     # Optimizer
     learning_rate: float = 2e-5
@@ -534,6 +566,52 @@ class Args:
         if self.mix_partial_rollouts:
             self.partial_rollouts_model_names = [n.strip() for n in self.partial_rollouts_model_names.split(",") if n.strip()]
 
+
+def apply_runtime_config(args: Args, model_config: ModelConfig) -> None:
+    device_type = resolve_device_type(
+        args.device,
+        torch.cuda.is_available(),
+        torch.backends.mps.is_available(),
+    )
+    args.device_type = device_type
+    args.device = device_type
+
+    args.training_backend = resolve_training_backend(args.training_backend, device_type, DEEPSPEED_AVAILABLE)
+    args.rollout_backend = resolve_rollout_backend(args.rollout_backend, device_type, VLLM_AVAILABLE)
+    args.use_deepspeed = args.training_backend == "deepspeed"
+    args.use_vllm = args.rollout_backend == "vllm"
+
+    if device_type != "cuda" and model_config.attn_implementation == "flash_attention_2":
+        print(
+            "[Runtime Config] flash_attention_2 is CUDA-only; falling back to eager attention for non-CUDA device."
+        )
+        model_config.attn_implementation = None
+    resolved_attn = resolve_attn_implementation(device_type, model_config.attn_implementation)
+    if resolved_attn != model_config.attn_implementation:
+        print(
+            f"[Runtime Config] Overriding attn_implementation to '{resolved_attn}' for device '{device_type}'."
+        )
+        model_config.attn_implementation = resolved_attn
+
+    if model_config.torch_dtype is None:
+        model_config.torch_dtype = resolve_dtype_str(device_type)
+
+    if args.rollout_backend == "hf":
+        if args.tools:
+            raise ValueError("HF rollout backend does not support tool use. Remove --tools or use vLLM.")
+        if sum(args.num_learners_per_node) != 1:
+            raise ValueError("HF rollout backend currently supports only a single learner. Set --num_learners_per_node 1.")
+        if args.training_backend != "torch":
+            raise ValueError("HF rollout backend requires --training_backend torch.")
+        if args.temperature <= 0 and args.num_samples_per_prompt_rollout > 1:
+            raise ValueError(
+                "HF rollout backend requires sampling for multiple rollouts. Set --temperature > 0 or "
+                "--num_samples_per_prompt_rollout 1."
+            )
+
+    if args.training_backend == "torch" and sum(args.num_learners_per_node) != 1:
+        raise ValueError("Torch training backend currently supports only a single learner. Set --num_learners_per_node 1.")
+
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: Optional[int] = None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
     if axis is not None:
@@ -605,7 +683,7 @@ class ShufflingIterator:
         return batch
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class PolicyTrainerRayProcess(RayProcess):
     def from_pretrained(
         self,
@@ -616,19 +694,20 @@ class PolicyTrainerRayProcess(RayProcess):
         tokenizer: PreTrainedTokenizer,
     ):
         # ------------------------------------------------------------
-        # Monkey patch to load checkpoints with `weights_only=False`
-        # otherwise it errors out with:
-        # `_pickle.UnpicklingError: Weights only load failed. ` with pytorch 2.6.0
-        from deepspeed.runtime.checkpoint_engine import torch_checkpoint_engine
-        from deepspeed.utils import logger
+        # Monkey patch DeepSpeed checkpoint loading with `weights_only=False`
+        # to avoid `_pickle.UnpicklingError` under torch 2.6 when resuming.
+        # Only apply this when we are actually using the DeepSpeed backend.
+        if args.use_deepspeed:
+            from deepspeed.runtime.checkpoint_engine import torch_checkpoint_engine
+            from deepspeed.utils import logger
 
-        def load(self, path: str, map_location=None):
-            logger.info(f"[Torch] Loading checkpoint from {path}...")
-            partition = torch.load(path, map_location=map_location, weights_only=False)
-            logger.info(f"[Torch] Loaded checkpoint from {path}.")
-            return partition
+            def load(self, path: str, map_location=None):
+                logger.info(f"[Torch] Loading checkpoint from {path}...")
+                partition = torch.load(path, map_location=map_location, weights_only=False)
+                logger.info(f"[Torch] Loaded checkpoint from {path}.")
+                return partition
 
-        torch_checkpoint_engine.TorchCheckpointEngine.load = load
+            torch_checkpoint_engine.TorchCheckpointEngine.load = load
 
         # ------------------------------------------------------------
         self.args = args
@@ -636,109 +715,178 @@ class PolicyTrainerRayProcess(RayProcess):
         self.model_config = model_config
         self.beaker_config = beaker_config
         self.wandb_url = wandb_url
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device(self.local_rank)
-        deepspeed.init_distributed()
-
-        ds_config = get_train_ds_config(
-            offload=False,
-            adam_offload=False,
-            stage=args.deepspeed_stage,
-            bf16=True,
+        self.device_type = args.device_type or resolve_device_type(
+            args.device,
+            torch.cuda.is_available(),
+            torch.backends.mps.is_available(),
         )
-        ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-        ds_config["gradient_accumulation_steps"] = 1
-        # @vwxyzjn: MAGIC: it's actually needed to initialize this `dschf`, so
-        # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
-        # next line instructs transformers to partition the model directly over multiple gpus using
-        # deepspeed.zero.Init when model's `from_pretrained` method is called.
-        if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            dschf = HfDeepSpeedConfig(ds_config)
+        if self.device_type == "cuda":
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device(f"cuda:{self.local_rank}")
+        elif self.device_type == "mps":
+            self.device = torch.device("mps")
         else:
-            dschf = None
-        print(f"{dschf=}")
+            self.device = torch.device("cpu")
 
-        self.policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.model_revision,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            use_cache=False,
-        )
-        disable_dropout_in_model(self.policy)
-        self.policy.gradient_checkpointing_enable()
-        # AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
-        # AdamOptimizer = FusedAdam
-        if args.set_weight_decay_on_bias_and_norm:
-            optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
-        else:
-            optim_params = self.policy.parameters()
-        # self.optimizer = AdamOptimizer(optim_params, lr=args.learning_rate)
-        self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
-        num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
-        warm_up_steps = args.warm_up_steps
-        if args.warmup_ratio > 0.0:
-            warm_up_steps = int(num_scheduler_steps * args.warmup_ratio)
-        scheduler = get_scheduler(
-            args.lr_scheduler_type,
-            optimizer=self.optimizer,
-            num_warmup_steps=warm_up_steps,
-            num_training_steps=num_scheduler_steps,
-        )
-        self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
-            model=self.policy,
-            optimizer=self.optimizer,
-            config=ds_config,
-            lr_scheduler=scheduler,
-            dist_init_required=True,
-        )
-        optimization_steps_done = 0
-        if args.checkpoint_state_dir:
-            # check if the dir exists
-            if not os.path.exists(args.checkpoint_state_dir):
-                print(f"Skipping loading checkpoint state from {args.checkpoint_state_dir} because it does not exist!")
+        self.use_deepspeed = args.use_deepspeed
+        dtype_str = model_config.torch_dtype or resolve_dtype_str(self.device_type)
+        self.torch_dtype = torch_dtype_from_str(dtype_str)
+        attn_impl = model_config.attn_implementation or resolve_attn_implementation(self.device_type)
+        model_kwargs = {
+            "revision": model_config.model_revision,
+            "torch_dtype": self.torch_dtype,
+            "use_cache": False,
+        }
+        if attn_impl:
+            model_kwargs["attn_implementation"] = attn_impl
+
+        if self.use_deepspeed:
+            if not DEEPSPEED_AVAILABLE:
+                raise RuntimeError("DeepSpeed backend requested but DeepSpeed is not available.")
+            if self.device_type != "cuda":
+                raise RuntimeError("DeepSpeed backend requires CUDA.")
+
+            deepspeed.init_distributed()
+            ds_config = get_train_ds_config(
+                offload=False,
+                adam_offload=False,
+                stage=args.deepspeed_stage,
+                bf16=self.torch_dtype == torch.bfloat16,
+            )
+            ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
+            ds_config["gradient_accumulation_steps"] = 1
+            # @vwxyzjn: MAGIC: it's actually needed to initialize this `dschf`, so
+            # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
+            # next line instructs transformers to partition the model directly over multiple gpus using
+            # deepspeed.zero.Init when model's `from_pretrained` method is called.
+            if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
+                dschf = HfDeepSpeedConfig(ds_config)
             else:
-                path, states = self.model.load_checkpoint(
-                    args.checkpoint_state_dir,
-                    load_module_strict=True,
-                    load_optimizer_states=True,
-                    load_lr_scheduler_states=True,
-                    load_module_only=False,
-                )
-                if path is None:
-                    raise ValueError(f"Failed to load checkpoint from {args.checkpoint_state_dir}")
-                optimization_steps_done = states["training_step"]
-                print(
-                    f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
-                )
-        self.model.train()
+                dschf = None
+            print(f"{dschf=}")
 
-        # reference model
-        ds_config = get_eval_ds_config(
-            offload=False,
-            # inference model only has stage 3 (sharding) or stage 0 (no sharding)
-            # stage 2 is optimizer sharding which doesn't apply to inference
-            stage=args.deepspeed_stage if args.deepspeed_stage == 3 else 0,
-            bf16=True,
-        )
-        ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-        ds_config["gradient_accumulation_steps"] = 1
-        if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            dschf = HfDeepSpeedConfig(ds_config)
+            self.policy = AutoModelForCausalLM.from_pretrained(
+                model_config.model_name_or_path,
+                **model_kwargs,
+            )
+            disable_dropout_in_model(self.policy)
+            self.policy.gradient_checkpointing_enable()
+            if args.set_weight_decay_on_bias_and_norm:
+                optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
+            else:
+                optim_params = self.policy.parameters()
+            fused = args.fused_optimizer and self.device_type == "cuda"
+            self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=fused)
+            num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
+            warm_up_steps = args.warm_up_steps
+            if args.warmup_ratio > 0.0:
+                warm_up_steps = int(num_scheduler_steps * args.warmup_ratio)
+            scheduler = get_scheduler(
+                args.lr_scheduler_type,
+                optimizer=self.optimizer,
+                num_warmup_steps=warm_up_steps,
+                num_training_steps=num_scheduler_steps,
+            )
+            self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
+                model=self.policy,
+                optimizer=self.optimizer,
+                config=ds_config,
+                lr_scheduler=scheduler,
+                dist_init_required=True,
+            )
+            self.stage = args.deepspeed_stage
+            optimization_steps_done = 0
+            if args.checkpoint_state_dir:
+                if not os.path.exists(args.checkpoint_state_dir):
+                    print(
+                        f"Skipping loading checkpoint state from {args.checkpoint_state_dir} because it does not exist!"
+                    )
+                else:
+                    path, states = self.model.load_checkpoint(
+                        args.checkpoint_state_dir,
+                        load_module_strict=True,
+                        load_optimizer_states=True,
+                        load_lr_scheduler_states=True,
+                        load_module_only=False,
+                    )
+                    if path is None:
+                        raise ValueError(f"Failed to load checkpoint from {args.checkpoint_state_dir}")
+                    optimization_steps_done = states["training_step"]
+                    print(
+                        f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
+                    )
+            self.model.train()
+
+            ds_config = get_eval_ds_config(
+                offload=False,
+                stage=args.deepspeed_stage if args.deepspeed_stage == 3 else 0,
+                bf16=self.torch_dtype == torch.bfloat16,
+            )
+            ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
+            ds_config["gradient_accumulation_steps"] = 1
+            if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
+                dschf = HfDeepSpeedConfig(ds_config)
+            else:
+                dschf = None
+            print(f"{dschf=}")
+
+            self.ref_policy = AutoModelForCausalLM.from_pretrained(
+                model_config.model_name_or_path,
+                **model_kwargs,
+            )
+            disable_dropout_in_model(self.ref_policy)
+            self.ref_policy, *_ = deepspeed.initialize(model=self.ref_policy, config=ds_config)
+            self.ref_policy.eval()
         else:
-            dschf = None
-        print(f"{dschf=}")
+            self.stage = 0
+            self.policy = AutoModelForCausalLM.from_pretrained(
+                model_config.model_name_or_path,
+                **model_kwargs,
+            )
+            disable_dropout_in_model(self.policy)
+            self.policy.gradient_checkpointing_enable()
+            self.policy.to(self.device)
+            if args.set_weight_decay_on_bias_and_norm:
+                optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
+            else:
+                optim_params = self.policy.parameters()
+            fused = args.fused_optimizer and self.device_type == "cuda"
+            self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=fused)
+            num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
+            warm_up_steps = args.warm_up_steps
+            if args.warmup_ratio > 0.0:
+                warm_up_steps = int(num_scheduler_steps * args.warmup_ratio)
+            self.scheduler = get_scheduler(
+                args.lr_scheduler_type,
+                optimizer=self.optimizer,
+                num_warmup_steps=warm_up_steps,
+                num_training_steps=num_scheduler_steps,
+            )
+            self.model = self.policy
+            optimization_steps_done = 0
+            if args.checkpoint_state_dir:
+                ckpt_path = os.path.join(args.checkpoint_state_dir, "torch_checkpoint.pt")
+                if not os.path.exists(ckpt_path):
+                    print(f"Skipping loading torch checkpoint from {ckpt_path} because it does not exist!")
+                else:
+                    state = torch.load(ckpt_path, map_location="cpu")
+                    self.model.load_state_dict(state.get("model", {}))
+                    if "optimizer" in state:
+                        self.optimizer.load_state_dict(state["optimizer"])
+                    if "scheduler" in state:
+                        self.scheduler.load_state_dict(state["scheduler"])
+                    optimization_steps_done = state.get("client_state", {}).get("training_step", 0)
+                    print(f"{self.rank=}: Loaded torch checkpoint from {ckpt_path} with {optimization_steps_done=}")
+            self.model.train()
 
-        self.ref_policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.model_revision,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            use_cache=False,
-        )
-        disable_dropout_in_model(self.ref_policy)
-        self.ref_policy, *_ = deepspeed.initialize(model=self.ref_policy, config=ds_config)
-        self.ref_policy.eval()
+            self.ref_policy = AutoModelForCausalLM.from_pretrained(
+                model_config.model_name_or_path,
+                **model_kwargs,
+            )
+            disable_dropout_in_model(self.ref_policy)
+            self.ref_policy.to(self.device)
+            self.ref_policy.eval()
+
         self.local_metrics = MetricsTracker(max_metrics=32, device=self.device)
         return optimization_steps_done
 
@@ -767,7 +915,74 @@ class PolicyTrainerRayProcess(RayProcess):
         logprob = log_softmax_and_gather(logits, input_ids[:, 1:])
         return logprob
 
+    def generate_responses(self, prompt_token_ids: List[List[int]], generation_kwargs: Dict[str, Union[int, float, bool]]):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        was_training = model.training
+        model.eval()
+        pad_token_id = generation_kwargs.get("pad_token_id", self.tokenizer.pad_token_id)
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        eos_token_id = generation_kwargs.get("eos_token_id", self.tokenizer.eos_token_id)
+        input_tensors = [torch.tensor(ids, dtype=torch.long) for ids in prompt_token_ids]
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_tensors,
+            batch_first=True,
+            padding_value=pad_token_id,
+        )
+        attention_mask = input_ids != pad_token_id
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
+        num_return_sequences = int(generation_kwargs.get("num_return_sequences", 1))
+        max_new_tokens = int(generation_kwargs.get("max_new_tokens", 0))
+        temperature = float(generation_kwargs.get("temperature", 1.0))
+        top_p = float(generation_kwargs.get("top_p", 1.0))
+        do_sample = bool(generation_kwargs.get("do_sample", temperature > 0))
+
+        with torch.inference_mode():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                num_return_sequences=num_return_sequences,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+            )
+
+        prompt_lengths = [len(p) for p in prompt_token_ids]
+        if num_return_sequences > 1:
+            prompt_lengths = [length for length in prompt_lengths for _ in range(num_return_sequences)]
+
+        response_ids = []
+        finish_reasons = []
+        for output, prompt_len in zip(outputs, prompt_lengths):
+            response = output[prompt_len:].tolist()
+            while response and response[-1] == pad_token_id:
+                response.pop()
+            response_ids.append(response)
+            finish_reasons.append("stop" if eos_token_id in response else "length")
+
+        masks = [[1] * len(response) for response in response_ids]
+        num_calls = [0] * len(response_ids)
+        timeouts = [0] * len(response_ids)
+        tool_errors = [""] * len(response_ids)
+        tool_outputs = [""] * len(response_ids)
+        tool_runtimes = [0] * len(response_ids)
+        tool_calleds = [False] * len(response_ids)
+
+        if was_training:
+            model.train()
+
+        return response_ids, finish_reasons, masks, (num_calls, timeouts, tool_errors, tool_outputs, tool_runtimes, tool_calleds)
+
     def setup_model_update_group(self, vllm_engines):
+        if not self.args.use_vllm:
+            return
+        if not self.use_deepspeed:
+            raise RuntimeError("vLLM weight sync requires DeepSpeed training backend.")
         self.vllm_engines = vllm_engines
         if self.rank == 0:
             master_address = ray._private.services.get_node_ip_address()
@@ -802,6 +1017,10 @@ class PolicyTrainerRayProcess(RayProcess):
         torch.distributed.barrier()
 
     def broadcast_to_vllm(self):
+        if not self.args.use_vllm:
+            return
+        if not self.use_deepspeed:
+            raise RuntimeError("vLLM weight sync requires DeepSpeed training backend.")
         # clear vllm cache if we need to
         cache_reset_refs = []
         if self.args.vllm_enable_prefix_caching and torch.distributed.get_rank() == 0:
@@ -809,7 +1028,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 cache_reset_refs.append(engine.reset_prefix_cache.remote())
 
         # avoid OOM
-        torch.cuda.empty_cache()
+        maybe_empty_cache(self.device_type)
         model = self.model.module
         count, num_params = 0, len(list(model.named_parameters()))
         refss = []
@@ -850,15 +1069,19 @@ class PolicyTrainerRayProcess(RayProcess):
             ray.get(cache_reset_refs)
 
     def update_ref_policy(self):
-        for ref_param, param in zip(self.ref_policy.parameters(), self.model.parameters()):
-            if self.args.deepspeed_stage == 3:
-                with deepspeed.zero.GatheredParameters(
-                    [param, ref_param],
-                    modifier_rank=0,
-                ):
-                    if deepspeed.comm.get_rank() == 0:
-                        ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
-            else:
+        if self.use_deepspeed:
+            for ref_param, param in zip(self.ref_policy.parameters(), self.model.parameters()):
+                if self.args.deepspeed_stage == 3:
+                    with deepspeed.zero.GatheredParameters(
+                        [param, ref_param],
+                        modifier_rank=0,
+                    ):
+                        if deepspeed.comm.get_rank() == 0:
+                            ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
+                else:
+                    ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
+        else:
+            for ref_param, param in zip(self.ref_policy.parameters(), self.model.parameters()):
                 ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
 
     def train(
@@ -873,6 +1096,8 @@ class PolicyTrainerRayProcess(RayProcess):
         num_mini_batches: int,
     ):
         args = self.args
+        if not self.use_deepspeed:
+            self.optimizer.zero_grad(set_to_none=True)
         to_device_inplace(collated_query_responses, self.device)
         to_device_inplace(collated_tool_masks, self.device)
         to_device_inplace(collated_attention_masks, self.device)
@@ -914,7 +1139,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         response_mask = response_mask.bool()
                     ref_logprob = torch.masked_fill(ref_logprob, ~response_mask[:, 1:], INVALID_LOGPROB)
                     collated_ref_logprobs.append(ref_logprob)
-                    torch.cuda.empty_cache()
+                    maybe_empty_cache(self.device_type)
         local_step = 0
         # Do multiple epochs of training on on-policy data (PPO-style), with a fresh random shuffle in each epoch
         with Timer("[Training Processes] Loss calculation", noop=self.rank != 0):
@@ -992,9 +1217,16 @@ class PolicyTrainerRayProcess(RayProcess):
                             print(f"⚠️ [Rank {self.rank}] Skipping backward/step due to NaN loss at local_step {local_step}, epoch {epoch_idx}, batch {i}")
                     else:
                         loss = loss / accumulation_steps
-                        self.model.backward(loss)
-                        if accumulation_steps > 0 and (local_step + 1) % accumulation_steps == 0:
-                            self.model.step()
+                        if self.use_deepspeed:
+                            self.model.backward(loss)
+                            if accumulation_steps > 0 and (local_step + 1) % accumulation_steps == 0:
+                                self.model.step()
+                        else:
+                            loss.backward()
+                            if accumulation_steps > 0 and (local_step + 1) % accumulation_steps == 0:
+                                self.optimizer.step()
+                                self.scheduler.step()
+                                self.optimizer.zero_grad(set_to_none=True)
                     local_step += 1
                     with torch.no_grad():
                         # NOTE: in packed implementation, kl calculation are averages over response tokens
@@ -1033,19 +1265,47 @@ class PolicyTrainerRayProcess(RayProcess):
 
     def save_checkpoint_state(self, checkpoint_state_dir: str, client_state: Dict[str, str]) -> None:
         args = self.args
-        self.model.save_checkpoint(checkpoint_state_dir, client_state=client_state)
-        # `save_checkpoint` needs to be called on all ranks, only rank 0 will have all the states
-        if self.rank == 0:
-            if args.keep_last_n_checkpoints >= 0:
-                clean_last_n_checkpoints_deepspeed(checkpoint_state_dir, args.keep_last_n_checkpoints)
+        if self.use_deepspeed:
+            self.model.save_checkpoint(checkpoint_state_dir, client_state=client_state)
+            # `save_checkpoint` needs to be called on all ranks, only rank 0 will have all the states
+            if self.rank == 0:
+                if args.keep_last_n_checkpoints >= 0:
+                    clean_last_n_checkpoints_deepspeed(checkpoint_state_dir, args.keep_last_n_checkpoints)
 
-            if args.gs_bucket_path is not None:
-                ray.remote(sync_gs_bucket).options(num_cpus=1).remote(
-                    checkpoint_state_dir,
-                    args.gs_checkpoint_state_dir,
-                )
+                if args.gs_bucket_path is not None:
+                    ray.remote(sync_gs_bucket).options(num_cpus=1).remote(
+                        checkpoint_state_dir,
+                        args.gs_checkpoint_state_dir,
+                    )
+        else:
+            if self.rank != 0:
+                return
+            os.makedirs(checkpoint_state_dir, exist_ok=True)
+            torch.save(
+                {
+                    "model": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "scheduler": self.scheduler.state_dict(),
+                    "client_state": client_state,
+                },
+                os.path.join(checkpoint_state_dir, "torch_checkpoint.pt"),
+            )
 
     def save_model(self, output_dir: str) -> None:
+        if not self.use_deepspeed:
+            if self.rank != 0:
+                return
+            os.makedirs(output_dir, exist_ok=True)
+            model_to_save = self.model
+            if hasattr(model_to_save, "module"):
+                model_to_save = model_to_save.module
+            if isinstance(model_to_save, PeftModel):
+                model_to_save.save_pretrained(output_dir)
+            else:
+                model_to_save.save_pretrained(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
+            return
+
         model_to_save = self.model
         if self.rank == 0:
             os.makedirs(output_dir, exist_ok=True)
@@ -1121,16 +1381,18 @@ class ModelGroup:
         self,
         pg: PlacementGroup,
         ray_process_cls: RayProcess,
-        num_gpus_per_node: List[int],
+        num_learners_per_node: List[int],
         single_gpu_mode: bool,
+        use_cuda: bool,
     ):
         self.pg = pg
         self.ray_process_cls = ray_process_cls
-        self.num_gpus_per_node = num_gpus_per_node
-        self.num_gpus_per_actor = 0.48 if single_gpu_mode else 1
+        self.num_learners_per_node = num_learners_per_node
+        self.use_cuda = use_cuda
+        self.num_gpus_per_actor = (0.48 if single_gpu_mode else 1) if use_cuda else 0
         self.num_cpus_per_actor = 4
         self.models = []
-        world_size = sum(self.num_gpus_per_node)
+        world_size = sum(self.num_learners_per_node)
         master_policy = ray_process_cls.options(
             num_cpus=self.num_cpus_per_actor,
             num_gpus=self.num_gpus_per_actor,
@@ -1142,11 +1404,11 @@ class ModelGroup:
         self.models.append(master_policy)
         master_addr, master_port = ray.get(master_policy.get_master_addr_port.remote())
 
-        def get_bundle_index(rank, num_gpus_per_node):
-            """given a rank and a list of num_gpus_per_node, return the index of the bundle that the rank belongs to"""
+        def get_bundle_index(rank, num_learners_per_node):
+            """given a rank and a list of learners-per-node, return the index of the bundle that the rank belongs to"""
             bundle_idx = 0
-            while rank >= num_gpus_per_node[bundle_idx]:
-                rank -= num_gpus_per_node[bundle_idx]
+            while rank >= num_learners_per_node[bundle_idx]:
+                rank -= num_learners_per_node[bundle_idx]
                 bundle_idx += 1
             return bundle_idx
 
@@ -1162,7 +1424,7 @@ class ModelGroup:
             print(f"{rank=}, {world_size=}, {rank=}, {master_addr=}, {master_port=}")
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=self.pg,
-                placement_group_bundle_index=get_bundle_index(rank, self.num_gpus_per_node),
+                placement_group_bundle_index=get_bundle_index(rank, self.num_learners_per_node),
             )
             worker_policy = ray_process_cls.options(
                 num_cpus=self.num_cpus_per_actor,
@@ -1254,6 +1516,46 @@ def vllm_generate_thread(
         print("[vLLM Generate Thread] 📊 Running step 0 evaluation before training starts")
         response_ids, finish_reasons, masks, info = generate_with_engines(
             eval_prompt_token_ids, eval_generation_config
+        )
+        evaluation_inference_results_Q.put((response_ids, finish_reasons, masks, info))
+
+
+def hf_generate_thread(
+    policy_actor: ray.actor.ActorHandle,
+    generation_kwargs: Dict[str, Union[int, float, bool]],
+    eval_generation_kwargs: Dict[str, Union[int, float, bool]],
+    inference_results_Q: Queue,
+    param_prompt_Q: Queue,
+    num_training_steps: int,
+    eval_prompt_token_ids: Optional[List[int]],
+    evaluation_inference_results_Q: Queue,
+    eval_freq: int,
+    resume_training_step: int = 1,
+):
+    for training_step in range(resume_training_step, num_training_steps + 1):
+        items = param_prompt_Q.get()
+        if items is None:
+            break
+        _, g_queries_list = items
+
+        with Timer("🔥 Generation time (HF)"):
+            response_ids, finish_reasons, masks, info = ray.get(
+                policy_actor.generate_responses.remote(g_queries_list, generation_kwargs)
+            )
+        inference_results_Q.put((response_ids, finish_reasons, masks, info))
+
+        if eval_prompt_token_ids is not None and (
+            (training_step - 1) % eval_freq == 0 or args.eval_at_step == training_step
+        ):
+            response_ids, finish_reasons, masks, info = ray.get(
+                policy_actor.generate_responses.remote(eval_prompt_token_ids, eval_generation_kwargs)
+            )
+            evaluation_inference_results_Q.put((response_ids, finish_reasons, masks, info))
+
+    if args.eval_at_step == 0 and eval_prompt_token_ids is not None:
+        print("[HF Generate Thread] Running step 0 evaluation before training starts")
+        response_ids, finish_reasons, masks, info = ray.get(
+            policy_actor.generate_responses.remote(eval_prompt_token_ids, eval_generation_kwargs)
         )
         evaluation_inference_results_Q.put((response_ids, finish_reasons, masks, info))
 
@@ -1958,7 +2260,12 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
         ray_temp_dir = os.path.join("/tmp", f"ray-{os.getpid()}")
         ray.init(dashboard_host="0.0.0.0", _temp_dir=ray_temp_dir)  # enable debugging from a different machine (e.g., phobos)
     pg = None
-    bundles = [{"GPU": actor_num_gpus, "CPU": actor_num_gpus * 10} for actor_num_gpus in args.num_learners_per_node]
+    use_cuda = args.device_type == "cuda"
+    cpu_per_learner = 10 if use_cuda else 4
+    bundles = [
+        {"GPU": num_learners if use_cuda else 0, "CPU": max(1, num_learners * cpu_per_learner)}
+        for num_learners in args.num_learners_per_node
+    ]
     pg = placement_group(bundles, strategy="STRICT_SPREAD")
     ray.get(pg.ready())
     inits = []
@@ -1967,6 +2274,7 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
         PolicyTrainerRayProcess,
         args.num_learners_per_node,
         args.single_gpu_mode,
+        use_cuda=args.device_type == "cuda",
     )
     wandb_url = wandb.run.get_url() if args.with_tracking else None
     inits.extend(
@@ -2002,55 +2310,80 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
             # Pass the entire args namespace; ToolActor will filter valid kwargs
             _register_actor_backed_tool(class_path=class_path, init_kwargs=vars(args))
 
-    vllm_engines = create_vllm_engines(
-        args.vllm_num_engines,
-        args.vllm_tensor_parallel_size,
-        args.vllm_enforce_eager,
-        tc.tokenizer_name_or_path,
-        model_config.model_name_or_path,
-        model_config.model_revision,
-        args.seed,
-        args.vllm_enable_prefix_caching,
-        max_len,
-        args.vllm_gpu_memory_utilization,
-        args.single_gpu_mode,
-        pg=pg if args.single_gpu_mode else None,
-        tools=tool_objects,
-        max_tool_calls=args.max_tool_calls,
-    )
+    vllm_engines = None
+    if args.use_vllm:
+        vllm_engines = create_vllm_engines(
+            args.vllm_num_engines,
+            args.vllm_tensor_parallel_size,
+            args.vllm_enforce_eager,
+            tc.tokenizer_name_or_path,
+            model_config.model_name_or_path,
+            model_config.model_revision,
+            args.seed,
+            args.vllm_enable_prefix_caching,
+            max_len,
+            args.vllm_gpu_memory_utilization,
+            args.single_gpu_mode,
+            pg=pg if args.single_gpu_mode else None,
+            tools=tool_objects,
+            max_tool_calls=args.max_tool_calls,
+        )
     resume_training_step = ray.get(inits)[0] + 1
     episode = (resume_training_step - 1) * args.num_unique_prompts_rollout * args.num_samples_per_prompt_rollout
-    print("======== ✅ all models and vLLM engines initialized =========")
+    print("======== ✅ all models initialized =========")
 
-    ray.get([m.setup_model_update_group.remote(vllm_engines=vllm_engines) for m in policy_group.models])
-    print("======== ✅ model update group setup successfully =========")
-    if resume_training_step > 1:
-        print(f"Resuming training from step {resume_training_step}... Broadcasting weights to vLLM engines.")
-        with Timer("[Main Thread] 🔄 Loading weights using shared memory"):
-            ray.get([m.broadcast_to_vllm.remote() for m in policy_group.models])
+    if args.use_vllm:
+        ray.get([m.setup_model_update_group.remote(vllm_engines=vllm_engines) for m in policy_group.models])
+        print("======== ✅ model update group setup successfully =========")
+        if resume_training_step > 1:
+            print(f"Resuming training from step {resume_training_step}... Broadcasting weights to vLLM engines.")
+            with Timer("[Main Thread] 🔄 Loading weights using shared memory"):
+                ray.get([m.broadcast_to_vllm.remote() for m in policy_group.models])
 
     # Setup training
     stop_strings = [] if args.stop_strings is None else args.stop_strings
     if args.tool_use:
         stop_strings += list(tool_objects.keys())
-    generation_config = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.vllm_top_p,  # prevent rare out-of-vocab tokens with qwen
-        max_tokens=args.response_length,
-        include_stop_str_in_output=True,
-        skip_special_tokens=False,
-        n=args.num_samples_per_prompt_rollout,
-        stop=stop_strings,
-    )
-    eval_generation_config = SamplingParams(
-        temperature=0.6,
-        top_p=args.vllm_top_p,  # prevent rare out-of-vocab tokens with qwen
-        max_tokens=args.response_length,
-        include_stop_str_in_output=True,
-        skip_special_tokens=False,
-        n=1,  # since we are doing greedy sampling, don't need to generate more
-        stop=stop_strings,
-    )
+    if args.use_vllm:
+        generation_config = SamplingParams(
+            temperature=args.temperature,
+            top_p=args.vllm_top_p,  # prevent rare out-of-vocab tokens with qwen
+            max_tokens=args.response_length,
+            include_stop_str_in_output=True,
+            skip_special_tokens=False,
+            n=args.num_samples_per_prompt_rollout,
+            stop=stop_strings,
+        )
+        eval_generation_config = SamplingParams(
+            temperature=0.6,
+            top_p=args.vllm_top_p,  # prevent rare out-of-vocab tokens with qwen
+            max_tokens=args.response_length,
+            include_stop_str_in_output=True,
+            skip_special_tokens=False,
+            n=1,  # since we are doing greedy sampling, don't need to generate more
+            stop=stop_strings,
+        )
+    else:
+        if stop_strings:
+            print("[Runtime Config] stop_strings are ignored for HF rollout backend.")
+        generation_config = {
+            "max_new_tokens": args.response_length,
+            "temperature": args.temperature,
+            "top_p": args.vllm_top_p,
+            "do_sample": args.temperature > 0,
+            "num_return_sequences": args.num_samples_per_prompt_rollout,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        eval_generation_config = {
+            "max_new_tokens": args.response_length,
+            "temperature": 0.6,
+            "top_p": args.vllm_top_p,
+            "do_sample": False,
+            "num_return_sequences": 1,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
     train_dataset_idxs = np.arange(len(train_dataset))
     iter_dataloader = ShufflingIterator(train_dataset_idxs, args.num_unique_prompts_rollout, seed=args.seed)
 
@@ -2066,24 +2399,43 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
         eval_prompt_token_ids = eval_dataset[INPUT_IDS_PROMPT_KEY]
         eval_ground_truths = eval_dataset[GROUND_TRUTHS_KEY]
         eval_dataset_names = eval_dataset[DATASET_SOURCE_KEY]
-    thread = threading.Thread(
-        target=vllm_generate_thread,
-        args=(
-            vllm_engines,
-            generation_config,
-            eval_generation_config,
-            inference_results_Q,
-            param_prompt_Q,
-            args.num_training_steps,
-            eval_prompt_token_ids,
-            evaluation_inference_results_Q,
-            args.eval_freq,
-            resume_training_step,
-            args.tool_use,
-        ),
-    )
-    thread.start()
-    print("======== ✅ vllm generate thread starts =========")
+    if args.use_vllm:
+        thread = threading.Thread(
+            target=vllm_generate_thread,
+            args=(
+                vllm_engines,
+                generation_config,
+                eval_generation_config,
+                inference_results_Q,
+                param_prompt_Q,
+                args.num_training_steps,
+                eval_prompt_token_ids,
+                evaluation_inference_results_Q,
+                args.eval_freq,
+                resume_training_step,
+                args.tool_use,
+            ),
+        )
+        thread.start()
+        print("======== ✅ vllm generate thread starts =========")
+    else:
+        thread = threading.Thread(
+            target=hf_generate_thread,
+            args=(
+                policy_group.models[0],
+                generation_config,
+                eval_generation_config,
+                inference_results_Q,
+                param_prompt_Q,
+                args.num_training_steps,
+                eval_prompt_token_ids,
+                evaluation_inference_results_Q,
+                args.eval_freq,
+                resume_training_step,
+            ),
+        )
+        thread.start()
+        print("======== ✅ hf generate thread starts =========")
 
     packing_thread = threading.Thread(
         target=data_preparation_thread,
@@ -2603,6 +2955,8 @@ if __name__ == "__main__":
     assert isinstance(args, Args)
     assert isinstance(tokenizer_config, TokenizerConfig)
     assert isinstance(model_config, ModelConfig)
+
+    apply_runtime_config(args, model_config)
 
     reward_fn_mapping = build_all_verifiers(args)
 

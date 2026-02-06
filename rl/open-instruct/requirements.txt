@@ -48,7 +48,7 @@ cycler==0.12.1
 cyclopts==3.22.2
 datasets==3.6.0
 debugpy==1.8.14
-deepspeed==0.15.4
+deepspeed==0.15.4 ; sys_platform != 'darwin'
 deprecated==1.2.18
 depyf==0.18.0
 dill==0.3.8
@@ -293,7 +293,7 @@ urllib3==2.4.0
 uvicorn==0.34.3
 uvloop==0.21.0 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
 virtualenv==20.31.2
-vllm==0.8.5.post1
+vllm==0.8.5.post1 ; sys_platform != 'darwin'
 wandb==0.18.1
 watchdog==6.0.0
 watchfiles==1.0.5
